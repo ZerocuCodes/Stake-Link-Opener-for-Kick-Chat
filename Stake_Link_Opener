@@ -1,0 +1,224 @@
+// ==UserScript==
+// @name         Kick Chat Drop Link Opener
+// @namespace    http://tampermonkey.net/
+// @version      3.1
+// @description  Watches for a user's chat message on Kick's virtualized chat, opens the Stake drop link, and auto-clicks the claim button.
+// @author       Zerocu
+// @match        https://kick.com/*
+// @match        https://stake.us/*
+// @match        https://stake.jp/*
+// @grant        GM_openInTab
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @run-at       document-end
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    // =================================================================================
+    // SCRIPT LOGIC FOR KICK.COM
+    // =================================================================================
+    if (window.location.hostname.includes('kick.com')) {
+        let targetUsername = '';
+        const processedMessages = new Set(); // Prevents processing the same message multiple times
+
+        // --- Create and display the UI ---
+        const ui = document.createElement('div');
+        ui.style.cssText = 'position: fixed; top: 10px; right: 10px; z-index: 10000; background: #1a1a1a; color: #fff; padding: 10px; border: 2px solid #00ff00; border-radius: 8px; font-family: sans-serif;';
+        ui.innerHTML = `
+            <h3 style="margin: 0 0 10px 0; color: #00ff00; text-align: center;">Auto-Claimer</h3>
+            <input type="text" id="targetUsername" placeholder="Enter username" style="background: #333; color: #fff; border: 1px solid #00ff00; padding: 5px; margin-bottom: 10px; width: 95%;">
+            <select id="stakeDomainSelect" style="width: 100%; padding: 5px; background: #333; color: #fff; border: 1px solid #00ff00; margin-bottom: 10px; border-radius: 4px;">
+                <option value="us">Stake.us</option>
+                <option value="jp">Stake.jp</option>
+                <option value="both">Both</option>
+            </select>
+            <button id="setTarget" style="background: #00ff00; color: #000; border: none; padding: 8px 10px; cursor: pointer; width: 100%; border-radius: 5px; font-weight: bold;">Set Target</button>
+            <div id="status" style="color: #aaa; font-size: 12px; margin-top: 8px; text-align: center;">Not watching.</div>
+        `;
+        document.body.appendChild(ui);
+
+        const usernameInput = document.getElementById('targetUsername');
+        const setButton = document.getElementById('setTarget');
+        const statusDiv = document.getElementById('status');
+        const domainSelect = document.getElementById('stakeDomainSelect');
+
+        // --- Load saved settings ---
+        (async () => {
+            const savedUser = await GM_getValue('targetUsername', '');
+            const savedDomain = await GM_getValue('stakeDomain', 'us');
+            if (savedUser) {
+                usernameInput.value = savedUser;
+                targetUsername = savedUser.toLowerCase();
+                statusDiv.textContent = `Watching for: ${savedUser}`;
+                statusDiv.style.color = '#00ff00';
+            }
+            domainSelect.value = savedDomain;
+        })();
+
+        // --- Save settings on click ---
+        setButton.addEventListener('click', () => {
+            const userToSet = usernameInput.value.trim();
+            const selectedDomain = domainSelect.value;
+            if (userToSet) {
+                targetUsername = userToSet.toLowerCase();
+                GM_setValue('targetUsername', userToSet);
+                GM_setValue('stakeDomain', selectedDomain);
+                statusDiv.textContent = `Watching for: ${userToSet}`;
+                statusDiv.style.color = '#00ff00';
+                console.log(`🎯 Target user set to: ${targetUsername} | Domain: ${selectedDomain}`);
+            } else {
+                targetUsername = '';
+                GM_setValue('targetUsername', '');
+                statusDiv.textContent = 'Not watching.';
+                statusDiv.style.color = '#aaa';
+                console.log('🔴 Target user cleared - not watching');
+            }
+        });
+
+        // --- Function to open drop links ---
+        async function openBonusLinks(code) {
+            const domain = await GM_getValue('stakeDomain', 'us');
+            const sanitizedCode = encodeURIComponent(code);
+            const urls = {
+                us: `https://stake.us/?type=drop&code=${sanitizedCode}&modal=redeemBonus`,
+                jp: `https://stake.jp/?type=drop&code=${sanitizedCode}&modal=redeemBonus`
+            };
+            if (domain === 'us' || domain === 'both') GM_openInTab(urls.us, { active: true });
+            if (domain === 'jp' || domain === 'both') GM_openInTab(urls.jp, { active: true });
+        }
+
+        // --- Improved message extraction function ---
+        function extractMessageData(messageContainer) {
+            // Try multiple selectors for username
+            const usernameElement = messageContainer.querySelector('button[title]') ||
+                                    messageContainer.querySelector('button.inline.font-bold');
+
+            // Try multiple selectors for message content
+            const messageElement = messageContainer.querySelector('span.font-normal.leading-\\[1\\.55\\]') ||
+                                   messageContainer.querySelector('span.font-normal') ||
+                                   messageContainer.querySelector('[class*="font-normal"]');
+
+            if (!usernameElement || !messageElement) return null;
+
+            // Extract username - try title first, then text content
+            const username = (usernameElement.title || usernameElement.textContent || '').trim().toLowerCase();
+
+            // Extract message text, excluding emotes and other elements
+            let messageText = '';
+            for (const node of messageElement.childNodes) {
+                if (node.nodeType === Node.TEXT_NODE) {
+                    messageText += node.textContent;
+                }
+            }
+            messageText = messageText.trim();
+
+            return { username, messageText };
+        }
+
+        // --- Enhanced mutation handler ---
+        const handleMutation = (mutation) => {
+            if (!targetUsername) return;
+
+            // Handle different types of mutations
+            let targetElement = null;
+
+            if (mutation.type === 'childList') {
+                // New nodes added
+                mutation.addedNodes.forEach(node => {
+                    if (node.nodeType === Node.ELEMENT_NODE) {
+                        // Check if the node itself is a message container
+                        if (node.hasAttribute('data-index')) {
+                            targetElement = node;
+                        } else {
+                            // Look for message containers within the added node
+                            const messageContainers = node.querySelectorAll('[data-index]');
+                            messageContainers.forEach(container => processMessageContainer(container));
+                        }
+                    }
+                });
+            } else if (mutation.type === 'characterData') {
+                // Text content changed
+                targetElement = mutation.target.closest('[data-index]');
+            } else if (mutation.type === 'attributes') {
+                // Attributes changed
+                targetElement = mutation.target.closest('[data-index]');
+            }
+
+            if (targetElement) {
+                processMessageContainer(targetElement);
+            }
+        };
+
+        // --- Process individual message container ---
+        function processMessageContainer(messageContainer) {
+            const messageData = extractMessageData(messageContainer);
+            if (!messageData) return;
+
+            const { username, messageText } = messageData;
+            const messageId = `${username}|${messageText}|${Date.now()}`;
+
+            if (username === targetUsername && messageText && !processedMessages.has(messageId)) {
+                console.log(`%cFound message from ${username}: ${messageText}`, 'color: lightgreen; font-weight: bold;');
+                processedMessages.add(messageId);
+                openBonusLinks(messageText);
+
+                // Clear old messages from memory after a short time
+                setTimeout(() => processedMessages.delete(messageId), 60000);
+            }
+        }
+
+        // --- Create and configure the observer ---
+        const observer = new MutationObserver((mutations) => {
+            mutations.forEach(handleMutation);
+        });
+
+        // --- Function to find the chat and start the observer ---
+        const startObserver = () => {
+            const chatContainer = document.querySelector('#chatroom-messages');
+            if (chatContainer) {
+                // Enhanced observer configuration for virtualized chat
+                observer.observe(chatContainer, {
+                    childList: true,
+                    subtree: true,
+                    characterData: true,
+                    attributes: false
+                });
+
+                console.log('✅ Enhanced observer started successfully.');
+
+                // Also process existing messages on startup
+                const existingMessages = chatContainer.querySelectorAll('[data-index]');
+                existingMessages.forEach(container => processMessageContainer(container));
+
+            } else {
+                // If chat isn't loaded yet, try again
+                console.log('Chat container not found, retrying...');
+                setTimeout(startObserver, 1000);
+            }
+        };
+
+        // Start after a short delay to ensure page is loaded
+        setTimeout(startObserver, 2000);
+    }
+
+    // =================================================================================
+    // SCRIPT LOGIC FOR STAKE.US / STAKE.JP
+    // =================================================================================
+    if (window.location.hostname.includes('stake.')) {
+        const findAndClickClaim = () => {
+            const claimButton = document.querySelector('button[data-testid="claim-bonus-claim"], button[data-analytics="claim-bonus-claim"]');
+            if (claimButton) {
+                console.log('✅ Claim button found and clicked!');
+                claimButton.click();
+                clearInterval(checkInterval);
+            }
+        };
+        const checkInterval = setInterval(findAndClickClaim, 500);
+        setTimeout(() => {
+            clearInterval(checkInterval);
+            console.log('⏰ Claim button search timeout (15s)');
+        }, 15000); // Stop after 15 seconds
+    }
+})();
